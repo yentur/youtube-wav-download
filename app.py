@@ -2,8 +2,6 @@ import yt_dlp
 import os
 import csv
 import random, time
-import hashlib
-import tarfile
 import boto3
 import requests
 import json
@@ -47,11 +45,50 @@ def video_already_downloaded(video_title, channel_path):
     expected_file = os.path.join(channel_path, f"{safe_title}.wav")
     return os.path.exists(expected_file)
 
-def download_single_video(video_url, video_title, channel_path, user, cookie_file=None):
-    """Tek bir videoyu indirip wav olarak kaydeder."""
+def ensure_s3_folder_exists(s3_client, bucket, folder_key):
+    """S3'te klasör var mı kontrol et, yoksa oluştur"""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=folder_key + "/")
+        print(f"📁 S3 klasörü mevcut: {folder_key}")
+    except:
+        s3_client.put_object(Bucket=bucket, Key=folder_key + "/")
+        print(f"📁 S3 klasörü oluşturuldu: {folder_key}")
+
+def upload_wav_to_s3(file_path, channel_name, filename):
+    """WAV dosyasını S3'e yükler"""
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+
+        # S3'te klasör yapısı: S3_FOLDER/channel_name/filename.wav
+        s3_key = f"{S3_FOLDER}/{channel_name}/{filename}"
+        
+        # Klasörün var olduğundan emin ol
+        ensure_s3_folder_exists(s3_client, S3_BUCKET, f"{S3_FOLDER}/{channel_name}")
+
+        print(f"☁️ S3'e yükleniyor: {file_path} -> s3://{S3_BUCKET}/{s3_key}")
+
+        file_size = os.path.getsize(file_path)
+        with open(file_path, 'rb') as f:
+            s3_client.upload_fileobj(f, S3_BUCKET, s3_key)
+
+        print(f"✅ S3 yükleme tamamlandı: s3://{S3_BUCKET}/{s3_key} ({file_size} bytes)")
+        return f"s3://{S3_BUCKET}/{s3_key}"
+        
+    except Exception as e:
+        print(f"❌ S3 yükleme hatası: {file_path} - {e}")
+        return None
+
+def download_single_video(video_url, video_title, channel_path, user, channel_name, cookie_file=None):
+    """Tek bir videoyu indirip wav olarak kaydeder ve S3'e yükler."""
     time.sleep(random.uniform(2, 5))
     safe_title = "".join(c if c.isalnum() or c in " -_()" else "_" for c in video_title)
     output_template = os.path.join(channel_path, f"{safe_title}.%(ext)s")
+    wav_file_path = os.path.join(channel_path, f"{safe_title}.wav")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -69,64 +106,45 @@ def download_single_video(video_url, video_title, channel_path, user, cookie_fil
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        log_to_csv(user, video_url, "success")
-        return (video_url, True, None)
+        
+        # WAV dosyasını S3'e yükle
+        s3_url = upload_wav_to_s3(wav_file_path, channel_name, f"{safe_title}.wav")
+        
+        if s3_url:
+            # Başarılı yükleme sonrası yerel dosyayı sil
+            try:
+                os.remove(wav_file_path)
+                print(f"🗑️ Yerel dosya silindi: {wav_file_path}")
+            except Exception as e:
+                print(f"⚠️ Yerel dosya silinirken hata: {e}")
+            
+            log_to_csv(user, video_url, "success", f"Uploaded to S3: {s3_url}")
+            return (video_url, True, None, s3_url)
+        else:
+            log_to_csv(user, video_url, "s3_error", "Failed to upload to S3")
+            return (video_url, False, "S3 upload failed", None)
+            
     except Exception as e:
         log_to_csv(user, video_url, "error", str(e))
-        return (video_url, False, str(e))
+        return (video_url, False, str(e), None)
 
-def create_archive_hash(directory_path):
-    """Klasör içeriğinden hash oluşturur"""
-    hasher = hashlib.md5()
-    for root, dirs, files in os.walk(directory_path):
-        for file in sorted(files):
-            file_path = os.path.join(root, file)
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hasher.update(chunk)
-    return hasher.hexdigest()
-
-def create_tar_gz(source_dir, output_path):
-    """Klasörü tar.gz olarak sıkıştırır"""
-    print(f"🗜️ Sıkıştırılıyor: {source_dir} -> {output_path}")
-    with tarfile.open(output_path, "w:gz") as tar:
-        tar.add(source_dir, arcname=os.path.basename(source_dir))
-    print(f"✅ Sıkıştırma tamamlandı: {output_path}")
-
-def ensure_s3_folder_exists(s3_client, bucket, folder_key):
-    """S3'te klasör var mı kontrol et, yoksa oluştur"""
-    try:
-        s3_client.head_object(Bucket=bucket, Key=folder_key + "/")
-        print(f"📁 S3 klasörü mevcut: {folder_key}")
-    except:
-        s3_client.put_object(Bucket=bucket, Key=folder_key + "/")
-        print(f"📁 S3 klasörü oluşturuldu: {folder_key}")
-
-def upload_to_s3(file_path, s3_key):
-    """Dosyayı S3'e yükler"""
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION
-    )
-
-    ensure_s3_folder_exists(s3_client, S3_BUCKET, S3_FOLDER)
-
-    full_s3_key = f"{S3_FOLDER}/{s3_key}"
-
-    print(f"☁️ S3'e yükleniyor: {file_path} -> s3://{S3_BUCKET}/{full_s3_key}")
-
-    file_size = os.path.getsize(file_path)
-    with open(file_path, 'rb') as f:
-        s3_client.upload_fileobj(f, S3_BUCKET, full_s3_key)
-
-    print(f"✅ S3 yükleme tamamlandı: s3://{S3_BUCKET}/{full_s3_key} ({file_size} bytes)")
-    return f"s3://{S3_BUCKET}/{full_s3_key}"
+def api_request_with_retry(func, max_retries=3, delay=5):
+    """API isteklerini retry mantığı ile yapar"""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except requests.exceptions.RequestException as e:
+            print(f"❌ API bağlantı hatası (deneme {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ {delay} saniye bekleniyor...")
+                time.sleep(delay)
+            else:
+                print("❌ Tüm denemeler başarısız oldu")
+                raise e
 
 def get_video_list_from_api():
-    """API'den video listesi alır"""
-    try:
+    """API'den video listesi alır - retry mantığı ile"""
+    def _get_video_list():
         print("📡 API'den video listesi alınıyor...")
         response = requests.get(f"{API_BASE_URL}/get-video-list", timeout=30)
         response.raise_for_status()
@@ -139,17 +157,19 @@ def get_video_list_from_api():
         else:
             print(f"❌ API'den hata: {data.get('message', 'Bilinmeyen hata')}")
             return [], None
-            
-    except requests.exceptions.RequestException as e:
-        print(f"❌ API bağlantı hatası: {e}")
-        return [], None
-    except json.JSONDecodeError as e:
-        print(f"❌ API response parse hatası: {e}")
+    
+    try:
+        return api_request_with_retry(_get_video_list)
+    except Exception as e:
+        print(f"❌ API'den video listesi alınamadı: {e}")
         return [], None
 
 def notify_api_completion(list_id, status, message=""):
-    """API'ye işlem tamamlandığını bildirir"""
-    try:
+    """API'ye işlem tamamlandığını bildirir - retry mantığı ile"""
+    if not list_id:
+        return
+        
+    def _notify_completion():
         payload = {
             "list_id": list_id,
             "status": status,
@@ -159,11 +179,37 @@ def notify_api_completion(list_id, status, message=""):
         response = requests.post(f"{API_BASE_URL}/notify-completion", json=payload, timeout=10)
         response.raise_for_status()
         print(f"✅ API'ye durum bildirildi: {status}")
+        return True
+    
+    try:
+        api_request_with_retry(_notify_completion)
     except Exception as e:
         print(f"⚠️ API'ye durum bildirme hatası: {e}")
 
+def get_video_info(video_url):
+    """Video URL'sinden video bilgilerini çeker"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            video_title = info.get('title', 'Unknown Title')
+            channel_name = info.get('uploader', 'Unknown Channel')
+            
+            # Güvenli dosya adı oluştur
+            safe_channel = "".join(c if c.isalnum() or c in " -_()" else "_" for c in channel_name)
+            
+            return safe_channel, video_title
+    except Exception as e:
+        print(f"⚠️ Video bilgisi alınamadı: {video_url} - {e}")
+        return "Unknown_Channel", "Unknown_Title"
+
 def download_videos_from_api(download_dir='downloads', max_workers=1):
-    """API'den video listesi alarak videoları indirir"""
+    """API'den video listesi alarak videoları indirir ve doğrudan S3'e yükler"""
     video_lines, list_id = get_video_list_from_api()
     
     if not video_lines:
@@ -179,19 +225,30 @@ def download_videos_from_api(download_dir='downloads', max_workers=1):
             video_url = line.get('video_url', '')
             video_title = line.get('video_title', '')
         else:
-            # String formatında geliyorsa (channel_name|video_url|video_title)
-            parts = line.split('|')
-            if len(parts) >= 3:
-                channel_name = parts[0]
-                video_url = parts[1]
-                video_title = parts[2]
+            # String formatında geliyorsa
+            line = line.strip()
+            
+            # URL olarak kontrol et
+            if line.startswith('https://') or line.startswith('http://'):
+                print(f"📋 URL tespit edildi, video bilgisi çekiliyor: {line}")
+                channel_name, video_title = get_video_info(line)
+                video_url = line
             else:
-                print(f"⚠️ Geçersiz format atlandı: {line}")
-                continue
+                # Pipe separated format (channel_name|video_url|video_title)
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    channel_name = parts[0].strip()
+                    video_url = parts[1].strip()
+                    video_title = parts[2].strip()
+                else:
+                    print(f"⚠️ Geçersiz format atlandı: {line}")
+                    continue
 
         if not all([channel_name, video_url, video_title]):
             print(f"⚠️ Eksik veri atlandı: {line}")
             continue
+
+        print(f"📹 İşlenecek: [{channel_name}] {video_title}")
 
         channel_path = os.path.join(download_dir, channel_name)
         os.makedirs(channel_path, exist_ok=True)
@@ -212,54 +269,42 @@ def download_videos_from_api(download_dir='downloads', max_workers=1):
 
     success_count = 0
     error_count = 0
+    uploaded_files = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(download_single_video, v_url, title, channel_path, channel_name, None)
+            executor.submit(download_single_video, v_url, title, channel_path, channel_name, channel_name, None)
             for v_url, title, channel_path, channel_name in videos_to_download
         ]
         for future in as_completed(futures):
-            video_url, success, error = future.result()
-            if success:
-                print(f"  ✅ İndirildi: {video_url}")
+            video_url, success, error, s3_url = future.result()
+            if success and s3_url:
+                print(f"  ✅ İndirildi ve S3'e yüklendi: {video_url}")
                 success_count += 1
+                uploaded_files.append(s3_url)
             else:
                 print(f"  ❌ Hata: {video_url} ({error})")
                 error_count += 1
 
     print(f"\n🎉 İşlem tamamlandı. Başarılı: {success_count}, Hata: {error_count}")
     print(f"📑 Log dosyası: {os.path.abspath(LOG_FILE)}")
+    print(f"☁️ S3'e yüklenen dosya sayısı: {len(uploaded_files)}")
 
-    # S3'e yükleme işlemi
-    if os.path.exists(download_dir) and os.listdir(download_dir):
-        try:
-            # Hash oluştur
-            archive_hash = create_archive_hash(download_dir)
+    # Boş klasörleri temizle
+    try:
+        for root, dirs, files in os.walk(download_dir, topdown=False):
+            if not files and not dirs:
+                os.rmdir(root)
+                print(f"🗑️ Boş klasör silindi: {root}")
+    except Exception as e:
+        print(f"⚠️ Klasör temizleme hatası: {e}")
 
-            # Tar.gz dosyası oluştur
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            archive_name = f"youtube_dataset_{timestamp}_{archive_hash[:8]}.tar.gz"
-            archive_path = os.path.join(os.getcwd(), archive_name)
-
-            create_tar_gz(download_dir, archive_path)
-
-            # S3'e yükle
-            s3_url = upload_to_s3(archive_path, archive_name)
-            print(f"🌐 S3 URL: {s3_url}")
-
-            # Yerel tar.gz dosyasını sil
-            os.remove(archive_path)
-            print(f"🗑️ Yerel arşiv dosyası silindi: {archive_path}")
-
-            # API'ye başarı durumunu bildir
-            notify_api_completion(list_id, "completed", f"Successfully processed {success_count} videos. S3 URL: {s3_url}")
-
-        except Exception as e:
-            print(f"❌ S3 yükleme hatası: {e}")
-            notify_api_completion(list_id, "error", f"S3 upload failed: {str(e)}")
-    else:
-        notify_api_completion(list_id, "completed", "No files to upload")
-        print("⚠️ İndirilmiş dosya bulunamadı, S3 yüklemesi yapılmadı.")
+    # API'ye başarı durumunu bildir
+    message = f"Successfully processed {success_count} videos. Uploaded {len(uploaded_files)} files to S3."
+    if error_count > 0:
+        message += f" {error_count} errors occurred."
+    
+    notify_api_completion(list_id, "completed" if error_count == 0 else "partial_success", message)
 
 if __name__ == "__main__":
     download_videos_from_api(max_workers=8)
