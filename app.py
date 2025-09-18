@@ -394,4 +394,4 @@ def download_videos_from_api(download_dir='downloads', max_workers=1):
     notify_api_completion(list_id, "completed" if error_count == 0 else "partial_success", message)
 
 if __name__ == "__main__":
-    download_videos_from_api(max_workers=1)  # Thread sayısını 1'e düşürdüm debug için
+    download_videos_from_api(max_workers=4)  # Thread sayısını 1'e düşürdüm debug için
